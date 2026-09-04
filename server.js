@@ -11,13 +11,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
 app.use(express.static(path.join(__dirname)));
 
 const PORT = process.env.PORT || 10000;
 
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
-const OWNER_TELEGRAM_ID = String(process.env.OWNER_TELEGRAM_ID || "");
+const OWNER_TELEGRAM_ID = String(
+  process.env.OWNER_TELEGRAM_ID || ""
+);
+
+/* =========================================================
+   GAME SETTINGS
+========================================================= */
+
+const MAX_PLAYERS = 50;
+const DEFAULT_ENTRY_FEE = 50;
+const DEFAULT_PRIZE = 400;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -31,6 +40,7 @@ let wss;
 const clients = new Map();
 
 let autoCallTimer = null;
+let autoCallBusy = false;
 
 /* =========================================================
    BASIC
@@ -78,7 +88,7 @@ async function initDatabase() {
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       entry_fee NUMERIC(12,2) NOT NULL,
-      max_players INTEGER NOT NULL DEFAULT 10,
+      max_players INTEGER NOT NULL DEFAULT 50,
       prize_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
       description TEXT DEFAULT '',
       active BOOLEAN DEFAULT TRUE,
@@ -124,22 +134,60 @@ async function initDatabase() {
     );
   `);
 
-  const count = await pool.query(
-    "SELECT COUNT(*) FROM game_types"
+  /* -------------------------------------------------------
+     Create default game type if it does not exist
+  ------------------------------------------------------- */
+
+  const existingType = await pool.query(
+    `
+    SELECT id
+    FROM game_types
+    WHERE name = 'Bingo Geda 50'
+    LIMIT 1
+    `
   );
 
-  if (Number(count.rows[0].count) === 0) {
+  if (existingType.rows.length === 0) {
     await pool.query(
       `
       INSERT INTO game_types
       (name, entry_fee, max_players, prize_amount, description)
-      VALUES
-      ('Bingo Geda 50', 50, 10, 400, 'Standard Bingo game')
+      VALUES ($1,$2,$3,$4,$5)
+      `,
+      [
+        "Bingo Geda 50",
+        DEFAULT_ENTRY_FEE,
+        MAX_PLAYERS,
+        DEFAULT_PRIZE,
+        "Standard Bingo game"
+      ]
+    );
+  } else {
+    /* -----------------------------------------------------
+       Important:
+       Existing database already had max_players = 10.
+       Update it to 50.
+       
+       Prize remains unchanged.
+    ----------------------------------------------------- */
+
+    await pool.query(
       `
+      UPDATE game_types
+      SET
+        max_players = $1,
+        entry_fee = $2
+      WHERE name = 'Bingo Geda 50'
+      `,
+      [
+        MAX_PLAYERS,
+        DEFAULT_ENTRY_FEE
+      ]
     );
   }
 
   console.log("Database initialized");
+  console.log(`Maximum players: ${MAX_PLAYERS}`);
 }
 
 /* =========================================================
@@ -192,52 +240,63 @@ function validateTelegramInitData(initData) {
       return null;
     }
 
-    const user = JSON.parse(userRaw);
-
-    return user;
+    return JSON.parse(userRaw);
   } catch (error) {
-    console.error("Telegram auth error:", error.message);
+    console.error(
+      "Telegram auth error:",
+      error.message
+    );
+
     return null;
   }
 }
 
 async function authenticate(req, res, next) {
-  const initData =
-    req.headers["x-telegram-init-data"] ||
-    req.body?.initData ||
-    "";
+  try {
+    const initData =
+      req.headers["x-telegram-init-data"] ||
+      req.body?.initData ||
+      "";
 
-  const user = validateTelegramInitData(initData);
+    const user = validateTelegramInitData(initData);
 
-  if (!user) {
-    return res.status(401).json({
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid Telegram authentication"
+      });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO users
+      (id, first_name, last_name, username)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (id)
+      DO UPDATE SET
+        first_name = EXCLUDED.first_name,
+        last_name = EXCLUDED.last_name,
+        username = EXCLUDED.username,
+        updated_at = NOW()
+      `,
+      [
+        user.id,
+        user.first_name || "",
+        user.last_name || "",
+        user.username || ""
+      ]
+    );
+
+    req.telegramUser = user;
+    next();
+  } catch (error) {
+    console.error("Authentication error:", error);
+
+    res.status(500).json({
       success: false,
-      error: "Invalid Telegram authentication"
+      error: "Authentication failed"
     });
   }
-
-  await pool.query(
-    `
-    INSERT INTO users
-    (id, first_name, last_name, username)
-    VALUES ($1,$2,$3,$4)
-    ON CONFLICT (id)
-    DO UPDATE SET
-      first_name = EXCLUDED.first_name,
-      last_name = EXCLUDED.last_name,
-      username = EXCLUDED.username,
-      updated_at = NOW()
-    `,
-    [
-      user.id,
-      user.first_name || "",
-      user.last_name || "",
-      user.username || ""
-    ]
-  );
-
-  req.telegramUser = user;
-  next();
 }
 
 function isOwner(user) {
@@ -245,7 +304,10 @@ function isOwner(user) {
 }
 
 function requireOwner(req, res, next) {
-  if (!req.telegramUser || !isOwner(req.telegramUser)) {
+  if (
+    !req.telegramUser ||
+    !isOwner(req.telegramUser)
+  ) {
     return res.status(403).json({
       success: false,
       error: "Owner only"
@@ -259,32 +321,38 @@ function requireOwner(req, res, next) {
    USER
 ========================================================= */
 
-app.get("/api/me", authenticate, async (req, res) => {
-  const user = req.telegramUser;
+app.get(
+  "/api/me",
+  authenticate,
+  async (req, res) => {
+    const user = req.telegramUser;
+    const owner = isOwner(user);
 
-  const owner = isOwner(user);
+    await pool.query(
+      `
+      UPDATE users
+      SET role = $1
+      WHERE id = $2
+      `,
+      [
+        owner ? "owner" : "player",
+        user.id
+      ]
+    );
 
-  await pool.query(
-    `
-    UPDATE users
-    SET role = $1
-    WHERE id = $2
-    `,
-    [owner ? "owner" : "player", user.id]
-  );
-
-  res.json({
-    success: true,
-    user: {
-      id: String(user.id),
-      first_name: user.first_name || "",
-      last_name: user.last_name || "",
-      username: user.username || ""
-    },
-    role: owner ? "owner" : "player",
-    isOwner: owner
-  });
-});
+    res.json({
+      success: true,
+      user: {
+        id: String(user.id),
+        first_name: user.first_name || "",
+        last_name: user.last_name || "",
+        username: user.username || ""
+      },
+      role: owner ? "owner" : "player",
+      isOwner: owner
+    });
+  }
+);
 
 /* =========================================================
    GAME TYPES
@@ -434,7 +502,9 @@ app.get("/api/game", async (req, res) => {
       success: true,
       game: {
         ...game,
-        players: Number(players.rows[0].count)
+        players: Number(
+          players.rows[0].count
+        )
       }
     });
   } catch (error) {
@@ -456,7 +526,10 @@ function randomNumbers(min, max, count) {
 
   while (numbers.length < count) {
     const number =
-      Math.floor(Math.random() * (max - min + 1)) + min;
+      Math.floor(
+        Math.random() *
+          (max - min + 1)
+      ) + min;
 
     if (!numbers.includes(number)) {
       numbers.push(number);
@@ -479,7 +552,9 @@ function generateBingoCard() {
     card.push([
       B[row],
       I[row],
-      row === 2 ? 0 : N[row > 2 ? row - 1 : row],
+      row === 2
+        ? 0
+        : N[row > 2 ? row - 1 : row],
       G[row],
       O[row]
     ]);
@@ -501,7 +576,10 @@ app.post(
 
       const gameResult = await pool.query(
         `
-        SELECT g.*, gt.entry_fee
+        SELECT
+          g.*,
+          gt.entry_fee,
+          gt.max_players
         FROM games g
         JOIN game_types gt
         ON gt.id = g.game_type_id
@@ -526,6 +604,28 @@ app.post(
         });
       }
 
+      /* Check 50-player limit before creating payment */
+
+      const playerCount = await pool.query(
+        `
+        SELECT COUNT(*)
+        FROM players
+        WHERE game_id = $1
+        AND payment_status = 'paid'
+        `,
+        [game_id]
+      );
+
+      if (
+        Number(playerCount.rows[0].count) >=
+        game.max_players
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Game is full"
+        });
+      }
+
       const txRef =
         "GEDA-" +
         Date.now() +
@@ -547,13 +647,15 @@ app.post(
       );
 
       /*
-        IMPORTANT:
+        TELEBIRR INTEGRATION
 
-        Telebirr API request will be implemented here
-        after the official merchant API credentials
-        and API specification are available.
+        This is still a placeholder.
 
-        DO NOT put Telebirr secrets in frontend.
+        The official Telebirr merchant API credentials
+        and API specification are required before real
+        payment processing can be enabled.
+
+        NEVER put Telebirr secrets in index.html.
       */
 
       res.json({
@@ -578,37 +680,41 @@ app.post(
 );
 
 /* =========================================================
-   TELEBIRR CALLBACK PLACEHOLDER
+   TELEBIRR CALLBACK
 ========================================================= */
 
-app.post("/api/payment/telebirr/callback", async (req, res) => {
-  try {
-    console.log("Telebirr callback received");
+app.post(
+  "/api/payment/telebirr/callback",
+  async (req, res) => {
+    try {
+      console.log(
+        "Telebirr callback received"
+      );
 
-    console.log(req.body);
+      console.log(req.body);
 
-    /*
-      IMPORTANT:
+      /*
+        IMPORTANT:
 
-      Never trust callback data alone.
+        Callback data must NOT be trusted by itself.
 
-      We will verify the transaction with Telebirr
-      using the official merchant API before marking
-      payment_status = paid.
-    */
+        We will verify the transaction with the official
+        Telebirr API before changing payment status to paid.
+      */
 
-    res.json({
-      success: true,
-      received: true
-    });
-  } catch (error) {
-    console.error(error);
+      res.json({
+        success: true,
+        received: true
+      });
+    } catch (error) {
+      console.error(error);
 
-    res.status(500).json({
-      success: false
-    });
+      res.status(500).json({
+        success: false
+      });
+    }
   }
-});
+);
 
 /* =========================================================
    PAYMENT STATUS
@@ -665,7 +771,10 @@ app.post(
     const client = await pool.connect();
 
     try {
-      const { game_id, tx_ref } = req.body;
+      const {
+        game_id,
+        tx_ref
+      } = req.body;
 
       await client.query("BEGIN");
 
@@ -684,11 +793,15 @@ app.post(
       );
 
       if (payment.rows.length === 0) {
-        throw new Error("Payment not found");
+        throw new Error(
+          "Payment not found"
+        );
       }
 
       if (payment.rows[0].status !== "paid") {
-        throw new Error("Payment has not been verified");
+        throw new Error(
+          "Payment has not been verified"
+        );
       }
 
       const existing = await client.query(
@@ -715,7 +828,9 @@ app.post(
 
       const gameResult = await client.query(
         `
-        SELECT g.*, gt.max_players
+        SELECT
+          g.*,
+          gt.max_players
         FROM games g
         JOIN game_types gt
         ON gt.id = g.game_type_id
@@ -726,10 +841,18 @@ app.post(
       );
 
       if (gameResult.rows.length === 0) {
-        throw new Error("Game not found");
+        throw new Error(
+          "Game not found"
+        );
       }
 
       const game = gameResult.rows[0];
+
+      if (game.status !== "waiting") {
+        throw new Error(
+          "Game is no longer accepting players"
+        );
+      }
 
       const playerCount = await client.query(
         `
@@ -742,13 +865,17 @@ app.post(
       );
 
       if (
-        Number(playerCount.rows[0].count) >=
-        game.max_players
+        Number(
+          playerCount.rows[0].count
+        ) >= game.max_players
       ) {
-        throw new Error("Game is full");
+        throw new Error(
+          "Game is full (50 players maximum)"
+        );
       }
 
-      const card = generateBingoCard();
+      const card =
+        generateBingoCard();
 
       const player = await client.query(
         `
@@ -769,7 +896,8 @@ app.post(
       broadcast({
         type: "player_joined",
         game_id,
-        user_id: String(req.telegramUser.id)
+        user_id:
+          String(req.telegramUser.id)
       });
 
       res.json({
@@ -820,12 +948,14 @@ app.post(
 
       const game = result.rows[0];
 
-      const called = game.called_numbers || [];
+      const called =
+        game.called_numbers || [];
 
       if (called.length >= 75) {
         return res.status(400).json({
           success: false,
-          error: "All numbers have been called"
+          error:
+            "All numbers have been called"
         });
       }
 
@@ -839,32 +969,45 @@ app.post(
 
       const number =
         remaining[
-          Math.floor(Math.random() * remaining.length)
+          Math.floor(
+            Math.random() *
+              remaining.length
+          )
         ];
 
-      const updatedCalled = [...called, number];
+      const updatedCalled = [
+        ...called,
+        number
+      ];
 
-      const updated = await pool.query(
-        `
-        UPDATE games
-        SET
-          called_numbers = $1,
-          current_number = $2,
-          status = 'playing',
-          started_at = COALESCE(started_at, NOW())
-        WHERE id = $3
-        RETURNING *
-        `,
-        [
-          updatedCalled,
-          number,
-          game.id
-        ]
-      );
+      const updated =
+        await pool.query(
+          `
+          UPDATE games
+          SET
+            called_numbers = $1,
+            current_number = $2,
+            status = 'playing',
+            started_at =
+              COALESCE(
+                started_at,
+                NOW()
+              )
+          WHERE id = $3
+          RETURNING *
+          `,
+          [
+            updatedCalled,
+            number,
+            game.id
+          ]
+        );
 
-      const letter = getBingoLetter(number);
+      const letter =
+        getBingoLetter(number);
 
-      const spoken = `${letter} ${number}`;
+      const spoken =
+        `${letter} ${number}`;
 
       broadcast({
         type: "number_called",
@@ -872,7 +1015,8 @@ app.post(
         number,
         letter,
         spoken,
-        called_numbers: updatedCalled
+        called_numbers:
+          updatedCalled
       });
 
       res.json({
@@ -880,16 +1024,20 @@ app.post(
         number,
         letter,
         spoken,
-        called_numbers: updatedCalled
+        called_numbers:
+          updatedCalled
       });
 
-      await checkAllPlayersForWinner(game.id);
+      await checkAllPlayersForWinner(
+        game.id
+      );
     } catch (error) {
       console.error(error);
 
       res.status(500).json({
         success: false,
-        error: "Could not call number"
+        error:
+          "Could not call number"
       });
     }
   }
@@ -900,11 +1048,40 @@ app.post(
 ========================================================= */
 
 function getBingoLetter(number) {
-  if (number >= 1 && number <= 15) return "B";
-  if (number >= 16 && number <= 30) return "I";
-  if (number >= 31 && number <= 45) return "N";
-  if (number >= 46 && number <= 60) return "G";
-  if (number >= 61 && number <= 75) return "O";
+  if (
+    number >= 1 &&
+    number <= 15
+  ) {
+    return "B";
+  }
+
+  if (
+    number >= 16 &&
+    number <= 30
+  ) {
+    return "I";
+  }
+
+  if (
+    number >= 31 &&
+    number <= 45
+  ) {
+    return "N";
+  }
+
+  if (
+    number >= 46 &&
+    number <= 60
+  ) {
+    return "G";
+  }
+
+  if (
+    number >= 61 &&
+    number <= 75
+  ) {
+    return "O";
+  }
 
   return "";
 }
@@ -913,29 +1090,47 @@ function getBingoLetter(number) {
    BINGO VALIDATION
 ========================================================= */
 
-function hasBingo(card, calledNumbers) {
-  const called = new Set(calledNumbers);
+function hasBingo(
+  card,
+  calledNumbers
+) {
+  const called =
+    new Set(calledNumbers);
 
-  const marked = card.map((row, r) =>
-    row.map((number, c) => {
-      if (r === 2 && c === 2) {
-        return true;
-      }
+  const marked =
+    card.map((row, r) =>
+      row.map((number, c) => {
+        if (
+          r === 2 &&
+          c === 2
+        ) {
+          return true;
+        }
 
-      return called.has(number);
-    })
-  );
+        return called.has(number);
+      })
+    );
+
+  /* Rows */
 
   for (let r = 0; r < 5; r++) {
-    if (marked[r].every(Boolean)) {
+    if (
+      marked[r].every(Boolean)
+    ) {
       return true;
     }
   }
 
+  /* Columns */
+
   for (let c = 0; c < 5; c++) {
     let complete = true;
 
-    for (let r = 0; r < 5; r++) {
+    for (
+      let r = 0;
+      r < 5;
+      r++
+    ) {
       if (!marked[r][c]) {
         complete = false;
         break;
@@ -947,9 +1142,15 @@ function hasBingo(card, calledNumbers) {
     }
   }
 
+  /* Diagonal 1 */
+
   let diagonal1 = true;
 
-  for (let i = 0; i < 5; i++) {
+  for (
+    let i = 0;
+    i < 5;
+    i++
+  ) {
     if (!marked[i][i]) {
       diagonal1 = false;
       break;
@@ -960,10 +1161,18 @@ function hasBingo(card, calledNumbers) {
     return true;
   }
 
+  /* Diagonal 2 */
+
   let diagonal2 = true;
 
-  for (let i = 0; i < 5; i++) {
-    if (!marked[i][4 - i]) {
+  for (
+    let i = 0;
+    i < 5;
+    i++
+  ) {
+    if (
+      !marked[i][4 - i]
+    ) {
       diagonal2 = false;
       break;
     }
@@ -976,50 +1185,65 @@ function hasBingo(card, calledNumbers) {
    WINNER CHECK
 ========================================================= */
 
-async function checkAllPlayersForWinner(gameId) {
-  const gameResult = await pool.query(
-    `
-    SELECT *
-    FROM games
-    WHERE id = $1
-    `,
-    [gameId]
-  );
+async function checkAllPlayersForWinner(
+  gameId
+) {
+  const gameResult =
+    await pool.query(
+      `
+      SELECT *
+      FROM games
+      WHERE id = $1
+      `,
+      [gameId]
+    );
 
-  if (gameResult.rows.length === 0) {
+  if (
+    gameResult.rows.length === 0
+  ) {
     return;
   }
 
-  const game = gameResult.rows[0];
+  const game =
+    gameResult.rows[0];
 
   if (game.winner_user_id) {
     return;
   }
 
-  const players = await pool.query(
-    `
-    SELECT *
-    FROM players
-    WHERE game_id = $1
-    AND payment_status = 'paid'
-    ORDER BY id ASC
-    `,
-    [gameId]
-  );
+  const players =
+    await pool.query(
+      `
+      SELECT *
+      FROM players
+      WHERE game_id = $1
+      AND payment_status = 'paid'
+      ORDER BY id ASC
+      `,
+      [gameId]
+    );
 
-  for (const player of players.rows) {
+  for (
+    const player of players.rows
+  ) {
     let card;
 
     try {
       card =
-        typeof player.card === "string"
+        typeof player.card ===
+        "string"
           ? JSON.parse(player.card)
           : player.card;
     } catch {
       continue;
     }
 
-    if (hasBingo(card, game.called_numbers)) {
+    if (
+      hasBingo(
+        card,
+        game.called_numbers
+      )
+    ) {
       await pool.query(
         `
         UPDATE games
@@ -1041,7 +1265,8 @@ async function checkAllPlayersForWinner(gameId) {
       broadcast({
         type: "winner",
         game_id: gameId,
-        user_id: String(player.user_id)
+        user_id:
+          String(player.user_id)
       });
 
       return;
@@ -1058,7 +1283,8 @@ app.post(
   authenticate,
   requireOwner,
   async (req, res) => {
-    const enabled = Boolean(req.body.enabled);
+    const enabled =
+      Boolean(req.body.enabled);
 
     if (enabled) {
       startAutoCall();
@@ -1078,99 +1304,156 @@ function startAutoCall() {
     return;
   }
 
-  autoCallTimer = setInterval(async () => {
-    try {
-      const gameResult = await pool.query(
-        `
-        SELECT *
-        FROM games
-        WHERE status IN ('waiting','playing')
-        ORDER BY id DESC
-        LIMIT 1
-        `
-      );
-
-      if (gameResult.rows.length === 0) {
-        stopAutoCall();
-        return;
-      }
-
-      const game = gameResult.rows[0];
-
-      if (game.winner_user_id) {
-        stopAutoCall();
-        return;
-      }
-
-      const called = game.called_numbers || [];
-
-      if (called.length >= 75) {
-        stopAutoCall();
-        return;
-      }
-
-      const remaining = [];
-
-      for (let i = 1; i <= 75; i++) {
-        if (!called.includes(i)) {
-          remaining.push(i);
+  autoCallTimer =
+    setInterval(
+      async () => {
+        if (autoCallBusy) {
+          return;
         }
-      }
 
-      const number =
-        remaining[
-          Math.floor(Math.random() * remaining.length)
-        ];
+        autoCallBusy = true;
 
-      const updatedCalled = [...called, number];
+        try {
+          const gameResult =
+            await pool.query(
+              `
+              SELECT *
+              FROM games
+              WHERE status IN
+              ('waiting','playing')
+              ORDER BY id DESC
+              LIMIT 1
+              `
+            );
 
-      await pool.query(
-        `
-        UPDATE games
-        SET
-          called_numbers = $1,
-          current_number = $2,
-          status = 'playing',
-          auto_call = TRUE,
-          started_at = COALESCE(started_at, NOW())
-        WHERE id = $3
-        `,
-        [
-          updatedCalled,
-          number,
-          game.id
-        ]
-      );
+          if (
+            gameResult.rows.length ===
+            0
+          ) {
+            stopAutoCall();
+            return;
+          }
 
-      const letter = getBingoLetter(number);
+          const game =
+            gameResult.rows[0];
 
-      broadcast({
-        type: "number_called",
-        game_id: game.id,
-        number,
-        letter,
-        spoken: `${letter} ${number}`,
-        called_numbers: updatedCalled
-      });
+          if (
+            game.winner_user_id
+          ) {
+            stopAutoCall();
+            return;
+          }
 
-      await checkAllPlayersForWinner(game.id);
-    } catch (error) {
-      console.error("Auto call error:", error.message);
-    }
-  }, 5000);
+          const called =
+            game.called_numbers ||
+            [];
+
+          if (
+            called.length >= 75
+          ) {
+            stopAutoCall();
+            return;
+          }
+
+          const remaining = [];
+
+          for (
+            let i = 1;
+            i <= 75;
+            i++
+          ) {
+            if (
+              !called.includes(i)
+            ) {
+              remaining.push(i);
+            }
+          }
+
+          const number =
+            remaining[
+              Math.floor(
+                Math.random() *
+                  remaining.length
+              )
+            ];
+
+          const updatedCalled =
+            [
+              ...called,
+              number
+            ];
+
+          await pool.query(
+            `
+            UPDATE games
+            SET
+              called_numbers = $1,
+              current_number = $2,
+              status = 'playing',
+              auto_call = TRUE,
+              started_at =
+                COALESCE(
+                  started_at,
+                  NOW()
+                )
+            WHERE id = $3
+            `,
+            [
+              updatedCalled,
+              number,
+              game.id
+            ]
+          );
+
+          const letter =
+            getBingoLetter(number);
+
+          broadcast({
+            type: "number_called",
+            game_id: game.id,
+            number,
+            letter,
+            spoken:
+              `${letter} ${number}`,
+            called_numbers:
+              updatedCalled
+          });
+
+          await checkAllPlayersForWinner(
+            game.id
+          );
+        } catch (error) {
+          console.error(
+            "Auto call error:",
+            error.message
+          );
+        } finally {
+          autoCallBusy = false;
+        }
+      },
+      5000
+    );
 }
 
 function stopAutoCall() {
   if (autoCallTimer) {
-    clearInterval(autoCallTimer);
+    clearInterval(
+      autoCallTimer
+    );
+
     autoCallTimer = null;
   }
 
-  pool.query(`
-    UPDATE games
-    SET auto_call = FALSE
-    WHERE status IN ('waiting','playing')
-  `).catch(console.error);
+  autoCallBusy = false;
+
+  pool
+    .query(`
+      UPDATE games
+      SET auto_call = FALSE
+      WHERE status IN
+      ('waiting','playing')
+    `)
+    .catch(console.error);
 
   broadcast({
     type: "auto_call_status",
@@ -1190,24 +1473,30 @@ app.post(
     try {
       stopAutoCall();
 
-      const result = await pool.query(
-        `
-        SELECT id
-        FROM games
-        WHERE status IN ('waiting','playing')
-        ORDER BY id DESC
-        LIMIT 1
-        `
-      );
+      const result =
+        await pool.query(
+          `
+          SELECT id
+          FROM games
+          WHERE status IN
+          ('waiting','playing')
+          ORDER BY id DESC
+          LIMIT 1
+          `
+        );
 
-      if (result.rows.length === 0) {
+      if (
+        result.rows.length === 0
+      ) {
         return res.json({
           success: true,
-          message: "No active game"
+          message:
+            "No active game"
         });
       }
 
-      const gameId = result.rows[0].id;
+      const gameId =
+        result.rows[0].id;
 
       await pool.query(
         `
@@ -1234,7 +1523,8 @@ app.post(
 
       res.status(500).json({
         success: false,
-        error: "Could not reset game"
+        error:
+          "Could not reset game"
       });
     }
   }
@@ -1244,62 +1534,95 @@ app.post(
    WEBSOCKET
 ========================================================= */
 
-const server = app.listen(PORT, async () => {
-  console.log(
-    `🎱 Bingo Geda server running on port ${PORT}`
-  );
+const server =
+  app.listen(
+    PORT,
+    async () => {
+      console.log(
+        `🎱 Bingo Geda server running on port ${PORT}`
+      );
 
-  try {
-    await initDatabase();
-  } catch (error) {
-    console.error(
-      "Database initialization failed:",
-      error.message
-    );
-  }
-});
-
-wss = new WebSocket.Server({
-  server
-});
-
-wss.on("connection", (socket) => {
-  const id = crypto.randomUUID();
-
-  clients.set(id, socket);
-
-  socket.send(
-    JSON.stringify({
-      type: "connected"
-    })
-  );
-
-  socket.on("message", async (message) => {
-    try {
-      const data = JSON.parse(message.toString());
-
-      if (data.type === "ping") {
-        socket.send(
-          JSON.stringify({
-            type: "pong"
-          })
+      try {
+        await initDatabase();
+      } catch (error) {
+        console.error(
+          "Database initialization failed:",
+          error.message
         );
       }
-    } catch {
-      // Ignore invalid websocket messages
     }
+  );
+
+wss =
+  new WebSocket.Server({
+    server
   });
 
-  socket.on("close", () => {
-    clients.delete(id);
-  });
-});
+wss.on(
+  "connection",
+  (socket) => {
+    const id =
+      crypto.randomUUID();
+
+    clients.set(
+      id,
+      socket
+    );
+
+    socket.send(
+      JSON.stringify({
+        type: "connected"
+      })
+    );
+
+    socket.on(
+      "message",
+      async (message) => {
+        try {
+          const data =
+            JSON.parse(
+              message.toString()
+            );
+
+          if (
+            data.type === "ping"
+          ) {
+            socket.send(
+              JSON.stringify({
+                type: "pong"
+              })
+            );
+          }
+        } catch {
+          // Ignore invalid messages
+        }
+      }
+    );
+
+    socket.on(
+      "close",
+      () => {
+        clients.delete(id);
+      }
+    );
+  }
+);
+
+/* =========================================================
+   BROADCAST
+========================================================= */
 
 function broadcast(message) {
-  const data = JSON.stringify(message);
+  const data =
+    JSON.stringify(message);
 
-  for (const socket of clients.values()) {
-    if (socket.readyState === WebSocket.OPEN) {
+  for (
+    const socket of clients.values()
+  ) {
+    if (
+      socket.readyState ===
+      WebSocket.OPEN
+    ) {
       socket.send(data);
     }
   }
